@@ -19,7 +19,6 @@ from torch import nn
 
 from nnunet.training.loss_functions.TopK_loss import TopKLoss
 from nnunet.training.loss_functions.crossentropy import RobustCrossEntropyLoss
-from nnunet.training.loss_functions.ece_wrap import RobustExclusiveCrossEntropyLoss
 from nnunet.utilities.nd_softmax import softmax_helper
 from nnunet.utilities.soft_skeleton import soft_skel
 from nnunet.utilities.tensor_utilities import sum_tensor
@@ -322,10 +321,7 @@ class DC_and_CE_loss(nn.Module):
         self.weight_dice = weight_dice
         self.weight_ce = weight_ce
         self.aggregate = aggregate
-        if ece:
-            self.ce = RobustExclusiveCrossEntropyLoss(**ce_kwargs)
-        else:
-            self.ce = RobustCrossEntropyLoss(**ce_kwargs)
+        self.ce = RobustCrossEntropyLoss(**ce_kwargs)
 
         self.ignore_label = ignore_label
 
