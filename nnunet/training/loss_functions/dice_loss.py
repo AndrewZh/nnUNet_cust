@@ -13,13 +13,16 @@
 #    limitations under the License.
 
 
+import numpy as np
 import torch
+from torch import nn
+
 from nnunet.training.loss_functions.TopK_loss import TopKLoss
 from nnunet.training.loss_functions.crossentropy import RobustCrossEntropyLoss
+from nnunet.training.loss_functions.ece_wrap import RobustExclusiveCrossEntropyLoss
 from nnunet.utilities.nd_softmax import softmax_helper
+from nnunet.utilities.soft_skeleton import soft_skel
 from nnunet.utilities.tensor_utilities import sum_tensor
-from torch import nn
-import numpy as np
 
 
 class GDL(nn.Module):
@@ -69,7 +72,7 @@ class GDL(nn.Module):
         tp, fp, fn, _ = get_tp_fp_fn_tn(x, y_onehot, axes, loss_mask, self.square)
 
         # GDL weight computation, we use 1/V
-        volumes = sum_tensor(y_onehot, axes) + 1e-6 # add some eps to prevent div by zero
+        volumes = sum_tensor(y_onehot, axes) + 1e-6  # add some eps to prevent div by zero
 
         if self.square_volumes:
             volumes = volumes ** 2
@@ -124,9 +127,7 @@ def get_tp_fp_fn_tn(net_output, gt, axes=None, mask=None, square=False):
             y_onehot = gt
         else:
             gt = gt.long()
-            y_onehot = torch.zeros(shp_x)
-            if net_output.device.type == "cuda":
-                y_onehot = y_onehot.cuda(net_output.device.index)
+            y_onehot = torch.zeros(shp_x, device=net_output.device)
             y_onehot.scatter_(1, gt, 1)
 
     tp = net_output * y_onehot
@@ -190,7 +191,6 @@ class SoftDiceLoss(nn.Module):
             else:
                 dc = dc[:, 1:]
         dc = dc.mean()
-
         return -dc
 
 
@@ -302,7 +302,8 @@ class SoftDiceLossSquared(nn.Module):
 
 
 class DC_and_CE_loss(nn.Module):
-    def __init__(self, soft_dice_kwargs, ce_kwargs, aggregate="sum", square_dice=False, weight_ce=1, weight_dice=1,
+    def __init__(self, soft_dice_kwargs, ce_kwargs, aggregate="sum", square_dice=False, clDice=False, weight_ce=1,
+                 weight_dice=1, ece=False,
                  log_dice=False, ignore_label=None):
         """
         CAREFUL. Weights for CE and Dice do not need to sum to one. You can set whatever you want.
@@ -321,20 +322,28 @@ class DC_and_CE_loss(nn.Module):
         self.weight_dice = weight_dice
         self.weight_ce = weight_ce
         self.aggregate = aggregate
-        self.ce = RobustCrossEntropyLoss(**ce_kwargs)
+        if ece:
+            self.ce = RobustExclusiveCrossEntropyLoss(**ce_kwargs)
+        else:
+            self.ce = RobustCrossEntropyLoss(**ce_kwargs)
 
         self.ignore_label = ignore_label
 
-        if not square_dice:
+        if clDice:
+            print('Using clDice')
+            self.dc = SoftCLDice(apply_nonlin=softmax_helper, **soft_dice_kwargs)
+        elif not square_dice:
+            print('Using SoftDice')
             self.dc = SoftDiceLoss(apply_nonlin=softmax_helper, **soft_dice_kwargs)
         else:
             self.dc = SoftDiceLossSquared(apply_nonlin=softmax_helper, **soft_dice_kwargs)
 
-    def forward(self, net_output, target):
+    def forward(self, net_output, target, epoch=None):
         """
         target must be b, c, x, y(, z) with c=1
         :param net_output:
         :param target:
+        :param epoch:
         :return:
         """
         if self.ignore_label is not None:
@@ -349,7 +358,11 @@ class DC_and_CE_loss(nn.Module):
         if self.log_dice:
             dc_loss = -torch.log(-dc_loss)
 
-        ce_loss = self.ce(net_output, target[:, 0].long()) if self.weight_ce != 0 else 0
+        if epoch is None:
+            ce_loss = self.ce(net_output, target[:, 0].long()) if self.weight_ce != 0 else 0
+        else:
+            ce_loss = self.ce(net_output, target[:, 0].long(), epoch=epoch) if self.weight_ce != 0 else 0
+
         if self.ignore_label is not None:
             ce_loss *= mask[:, 0]
             ce_loss = ce_loss.sum() / mask.sum()
@@ -357,13 +370,14 @@ class DC_and_CE_loss(nn.Module):
         if self.aggregate == "sum":
             result = self.weight_ce * ce_loss + self.weight_dice * dc_loss
         else:
-            raise NotImplementedError("nah son") # reserved for other stuff (later)
+            raise NotImplementedError("nah son")  # reserved for other stuff (later)
         return result
 
 
 class DC_and_BCE_loss(nn.Module):
     def __init__(self, bce_kwargs, soft_dice_kwargs, aggregate="sum"):
         """
+
         DO NOT APPLY NONLINEARITY IN YOUR NETWORK!
 
         THIS LOSS IS INTENDED TO BE USED FOR BRATS REGIONS ONLY
@@ -384,7 +398,7 @@ class DC_and_BCE_loss(nn.Module):
         if self.aggregate == "sum":
             result = ce_loss + dc_loss
         else:
-            raise NotImplementedError("nah son") # reserved for other stuff (later)
+            raise NotImplementedError("nah son")  # reserved for other stuff (later)
 
         return result
 
@@ -422,5 +436,78 @@ class DC_and_topk_loss(nn.Module):
         if self.aggregate == "sum":
             result = ce_loss + dc_loss
         else:
-            raise NotImplementedError("nah son") # reserved for other stuff (later?)
+            raise NotImplementedError("nah son")  # reserved for other stuff (later?)
         return result
+
+
+class SoftCLDice(nn.Module):
+    def __init__(self, apply_nonlin=None, do_bg=False, batch_dice=False, alpha=0.5, iter_=3, smooth=1.):
+        # alpha should be lower at 0.3, 0.2, 0.1, 0.01
+        # iter_ should be at diameter of the biggest foreground object
+        super(SoftCLDice, self).__init__()
+        self.iter = iter_
+        self.smooth = smooth
+        self.apply_nonlin = apply_nonlin
+        self.do_bg = do_bg
+        self.alpha = alpha
+        self.batch_dice = batch_dice
+
+    def forward(self, y_pred, y_true, loss_mask=None):
+        return (1 - self.alpha) * self.calc_dice(y_pred, y_true, loss_mask) \
+               + self.alpha * self.calc_cl_dice(y_pred, y_true)
+
+    def calc_dice(self, x, y, loss_mask=None):
+        shp_x = x.shape
+
+        if self.batch_dice:
+            axes = [0] + list(range(2, len(shp_x)))
+        else:
+            axes = list(range(2, len(shp_x)))
+
+        if self.apply_nonlin is not None:
+            x = self.apply_nonlin(x)
+
+        tp, fp, fn, _ = get_tp_fp_fn_tn(x, y, axes, loss_mask, False)
+
+        nominator = 2 * tp + self.smooth
+        denominator = 2 * tp + fp + fn + self.smooth
+
+        dc = nominator / (denominator + 1e-8)
+
+        if not self.do_bg:
+            if self.batch_dice:
+                dc = dc[1:]
+            else:
+                dc = dc[:, 1:]
+        dc = dc.mean()
+        return -dc
+
+    def calc_cl_dice(self, y_pred, y_true):
+        if self.apply_nonlin is not None:
+            x = self.apply_nonlin(y_pred)
+        shp_x = y_pred.shape
+        shp_y = y_true.shape
+        with torch.no_grad():
+            if len(shp_x) != len(shp_y):
+                y_true = y_true.view((shp_y[0], 1, *shp_y[1:]))
+
+            if all([i == j for i, j in zip(y_pred.shape, y_true.shape)]):
+                # if this is the case then gt is probably already a one hot encoding
+                y_onehot = y_true
+            else:
+                y_true = y_true.long()
+                y_onehot = torch.zeros(shp_x, device=y_pred.device)
+                y_onehot.scatter_(1, y_true, 1)
+
+        skel_pred = soft_skel(y_pred, self.iter)
+        skel_true = soft_skel(y_onehot, self.iter)
+
+        tprec = (torch.sum(torch.multiply(skel_pred, y_onehot)[:, 1:, ...], dim=(2, 3, 4)) + self.smooth) / \
+                (torch.sum(skel_pred[:, 1:, ...], dim=(2, 3, 4)) + self.smooth)
+        tsens = (torch.sum(torch.multiply(skel_true, y_pred)[:, 1:, ...], dim=(2, 3, 4)) + self.smooth) / \
+                (torch.sum(skel_true[:, 1:, ...], dim=(2, 3, 4)) + self.smooth)
+
+        cl_dice = - 2.0 * (tprec * tsens) / (tprec + tsens)
+        cl_dice = cl_dice.mean()
+
+        return cl_dice
